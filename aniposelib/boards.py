@@ -1,3 +1,5 @@
+import copy
+
 import cv2
 import numpy as np
 from abc import ABC, abstractmethod
@@ -327,7 +329,7 @@ class CalibrationObject(ABC):
             if framenum % skip != 0 and go <= 0:
                 continue
 
-            corners, ids = self.detect_image(frame)
+            corners, ids, board = self.detect_image(frame)
 
             if corners is not None and len(corners) > 0:
                 if prefix is None:
@@ -335,7 +337,7 @@ class CalibrationObject(ABC):
                 else:
                     key = (prefix, framenum)
                 go = int(skip / 2)
-                row = {'framenum': key, 'corners': corners, 'ids': ids}
+                row = {'framenum': key, 'corners': corners, 'ids': ids, 'min_id': np.min(board.ids)}
                 rows.append(row)
 
             go = max(0, go - 1)
@@ -348,9 +350,13 @@ class CalibrationObject(ABC):
 
     def estimate_pose_rows(self, camera, rows):
         for row in rows:
+            board=self.board
+            if row['min_id']>np.min(self.board.ids):
+                board=self.board2
             rvec, tvec = self.estimate_pose_points(camera,
                                                    row['corners'],
-                                                   row['ids'])
+                                                   row['ids'],
+                                                   board)
             row['rvec'] = rvec
             row['tvec'] = tvec
         return rows
@@ -669,6 +675,7 @@ class CharucoBoard(CalibrationObject):
 
         height, width = image.shape[:2]
         image = aruco.drawDetectedCornersCharuco(image, corners, ids)
+        #image = aruco.drawDetectedMarkers(image, corners, ids)
         cv2.putText(image, '(a) Accept (d) Reject', (int(width/1.35), int(height/16)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, 255, 1, cv2.LINE_AA)
         cv2.imshow('verify_detection', image)
         while 1:
@@ -699,5 +706,115 @@ class CharucoBoard(CalibrationObject):
 
         ret, rvec, tvec = aruco.estimatePoseCharucoBoard(
             corners, ids, self.board, K, D, None, None)
+
+        return rvec, tvec
+
+
+class DoubleSidedCharucoBoard(CharucoBoard):
+    def __init__(self,
+                 squaresX,
+                 squaresY,
+                 square_length,
+                 marker_length,
+                 marker_bits=4,
+                 dict_size=50,
+                 aruco_dict=None,
+                 manually_verify=False):
+
+        CharucoBoard.__init__(self,
+                              squaresX,
+                              squaresY,
+                              square_length,
+                              marker_length,
+                              marker_bits=marker_bits,
+                              dict_size=dict_size,
+                              aruco_dict=aruco_dict,
+                              manually_verify=manually_verify)
+        self.board2 = aruco.CharucoBoard_create(squaresX, squaresY,
+                                               square_length, marker_length,
+                                               self.dictionary)
+        self.board2.ids = self.board2.ids + len(self.board.ids)
+
+    def detect_markers(self, image, camera=None, refine=True):
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+
+        params = aruco.DetectorParameters_create()
+        params.cornerRefinementMethod = aruco.CORNER_REFINE_APRILTAG
+        params.cornerRefinementMethod = aruco.CORNER_REFINE_CONTOUR
+        params.adaptiveThreshWinSizeMin = 100
+        params.adaptiveThreshWinSizeMax = 700
+        params.adaptiveThreshWinSizeStep = 50
+        params.adaptiveThreshConstant = 0
+
+        try:
+            corners, ids, rejectedImgPoints = aruco.detectMarkers(
+                gray, self.dictionary, parameters=params)
+        except Exception:
+            ids = None
+
+
+        if ids is None:
+            return [], [], None
+
+        if camera is None:
+            K = D = None
+        else:
+            K = camera.get_camera_matrix()
+            D = camera.get_distortions()
+
+        board = self.board
+        if len(np.where(ids > np.max(self.board.ids))[0]) > 0:
+            board = self.board2
+
+        if refine:
+            detectedCorners, detectedIds, rejectedCorners, recoveredIdxs = \
+                aruco.refineDetectedMarkers(gray, board, corners, ids,
+                                            rejectedImgPoints,
+                                            K, D,
+                                            parameters=params)
+        else:
+            detectedCorners, detectedIds = corners, ids
+
+        return detectedCorners, detectedIds, board
+
+    def detect_image(self, image, camera=None):
+
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image
+
+        corners, ids, board = self.detect_markers(image, camera, refine=True)
+        if len(corners) > 0:
+            ret, detectedCorners, detectedIds = aruco.interpolateCornersCharuco(
+                corners, ids, gray, board)
+            if detectedIds is None:
+                detectedCorners = detectedIds = np.float64([])
+        else:
+            detectedCorners = detectedIds = np.float64([])
+
+        if len(detectedCorners) > 0 \
+            and self.manually_verify \
+            and not self.manually_verify_board_detection(gray, detectedCorners, detectedIds):
+            detectedCorners = detectedIds = np.float64([])
+
+        return detectedCorners, detectedIds, board
+
+
+    def estimate_pose_points(self, camera, corners, ids, board):
+        if corners is None or ids is None or len(corners) < 5:
+            return None, None
+
+        n_corners = corners.size // 2
+        corners = np.reshape(corners, (n_corners, 1, 2))
+
+        K = camera.get_camera_matrix()
+        D = camera.get_distortions()
+
+        ret, rvec, tvec = aruco.estimatePoseCharucoBoard(
+            corners, ids, board, K, D, None, None)
 
         return rvec, tvec
